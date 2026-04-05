@@ -60,6 +60,7 @@ LIMITER_SERVICE="/etc/systemd/system/firewallfalcon-limiter.service"
 BANDWIDTH_DIR="$DB_DIR/bandwidth"
 BANDWIDTH_SCRIPT="/usr/local/bin/firewallfalcon-bandwidth.sh"
 BANDWIDTH_SERVICE="/etc/systemd/system/firewallfalcon-bandwidth.service"
+LEGACY_BANDWIDTH_DIR="/usr/local/bin/firewallfalcon-bandwidth"
 TRIAL_CLEANUP_SCRIPT="/usr/local/bin/firewallfalcon-trial-cleanup.sh"
 LOGIN_INFO_SCRIPT="/usr/local/bin/firewallfalcon-login-info.sh"
 SSHD_FF_CONFIG="/etc/ssh/sshd_config.d/firewallfalcon.conf"
@@ -89,6 +90,7 @@ SSH_SESSION_CACHE_TTL=10
 SSH_SESSION_CACHE_TS=0
 SSH_SESSION_CACHE_DB_MTIME=0
 SSH_SESSION_TOTAL=0
+APT_CACHE_READY=0
 FF_USERS_GROUP="ffusers"
 declare -A SSH_SESSION_COUNTS=()
 declare -A SSH_SESSION_PIDS=()
@@ -98,18 +100,167 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# Mandatory Dependency Check (Added jq and curl)
-check_environment() {
-    # Mandatory Dependency Check (Added jq and curl)
-    for cmd in bc jq curl wget; do
-        if ! command -v $cmd &> /dev/null; then
-            echo -e "${C_YELLOW}⚠️ Warning: '$cmd' not found. Installing...${C_RESET}"
-            apt-get update > /dev/null 2>&1 && apt-get install -y $cmd || {
-                echo -e "${C_RED}❌ Error: Failed to install '$cmd'. Please install it manually.${C_RESET}"
-                exit 1
-            }
+get_ubuntu_codename() {
+    local codename=""
+
+    if [[ -r /etc/os-release ]]; then
+        codename=$(awk -F= '/^(VERSION_CODENAME|UBUNTU_CODENAME)=/{gsub(/"/, "", $2); if ($2 != "") { print $2; exit }}' /etc/os-release 2>/dev/null)
+    fi
+
+    if [[ -z "$codename" ]] && command -v lsb_release &>/dev/null; then
+        codename=$(lsb_release -sc 2>/dev/null)
+    fi
+
+    echo "$codename"
+}
+
+is_known_eol_ubuntu_codename() {
+    case "$1" in
+        yakkety|zesty|artful|cosmic|disco|eoan|groovy|hirsute|impish|kinetic|lunar|mantic|oracular|plucky)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+rewrite_ubuntu_apt_sources() {
+    local mode="$1"
+    local os_id=""
+    local changed=false
+    local file backup_file
+    local from_archive to_archive from_security to_security from_ports to_ports
+    local -a source_files=("/etc/apt/sources.list" /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources)
+
+    if [[ -r /etc/os-release ]]; then
+        os_id=$(awk -F= '/^ID=/{gsub(/"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null)
+    fi
+    [[ "$os_id" == "ubuntu" ]] || return 1
+
+    case "$mode" in
+        primary)
+            from_archive='https?://([A-Za-z0-9-]+\.)?archive\.ubuntu\.com/ubuntu'
+            to_archive='http://archive.ubuntu.com/ubuntu'
+            from_security='https?://security\.ubuntu\.com/ubuntu'
+            to_security='http://security.ubuntu.com/ubuntu'
+            from_ports='https?://ports\.ubuntu\.com/ubuntu-ports'
+            to_ports='http://ports.ubuntu.com/ubuntu-ports'
+            ;;
+        old-releases)
+            from_archive='https?://([A-Za-z0-9-]+\.)?archive\.ubuntu\.com/ubuntu'
+            to_archive='http://old-releases.ubuntu.com/ubuntu'
+            from_security='https?://security\.ubuntu\.com/ubuntu'
+            to_security='http://old-releases.ubuntu.com/ubuntu'
+            from_ports='https?://ports\.ubuntu\.com/ubuntu-ports'
+            to_ports='http://old-releases.ubuntu.com/ubuntu'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    for file in "${source_files[@]}"; do
+        [[ -f "$file" ]] || continue
+        if grep -Eq "$from_archive|$from_security|$from_ports" "$file" 2>/dev/null; then
+            backup_file="${file}.bak.firewallfalcon"
+            [[ -f "$backup_file" ]] || cp "$file" "$backup_file" 2>/dev/null || true
+            sed -i -E \
+                -e "s|$from_archive|$to_archive|g" \
+                -e "s|$from_security|$to_security|g" \
+                -e "s|$from_ports|$to_ports|g" \
+                "$file" 2>/dev/null
+            changed=true
         fi
     done
+
+    $changed
+}
+
+repair_ubuntu_apt_mirrors() {
+    rewrite_ubuntu_apt_sources "primary"
+}
+
+switch_ubuntu_to_old_releases() {
+    local codename
+    codename=$(get_ubuntu_codename)
+    [[ -n "$codename" ]] || return 1
+    is_known_eol_ubuntu_codename "$codename" || return 1
+    rewrite_ubuntu_apt_sources "old-releases"
+}
+
+ff_apt_update() {
+    local -a apt_opts=(
+        -o Acquire::Retries=3
+        -o Acquire::ForceIPv4=true
+        -o Acquire::http::Timeout=20
+        -o Acquire::https::Timeout=20
+        -o Acquire::http::Pipeline-Depth=0
+    )
+
+    if (( APT_CACHE_READY == 1 )); then
+        return 0
+    fi
+
+    if DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" update; then
+        APT_CACHE_READY=1
+        return 0
+    fi
+
+    if repair_ubuntu_apt_mirrors; then
+        echo -e "${C_YELLOW}⚠️ APT mirror timed out. Switching Ubuntu sources to archive.ubuntu.com and retrying...${C_RESET}"
+        apt-get clean >/dev/null 2>&1 || true
+        if DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" update; then
+            APT_CACHE_READY=1
+            return 0
+        fi
+    fi
+
+    if switch_ubuntu_to_old_releases; then
+        echo -e "${C_YELLOW}⚠️ Detected an end-of-life Ubuntu release. Switching APT sources to old-releases.ubuntu.com and retrying...${C_RESET}"
+        apt-get clean >/dev/null 2>&1 || true
+        if DEBIAN_FRONTEND=noninteractive apt-get "${apt_opts[@]}" update; then
+            APT_CACHE_READY=1
+            return 0
+        fi
+    fi
+
+    echo -e "${C_RED}❌ Failed to refresh package lists. Please check VPS network, DNS, or blocked Ubuntu mirrors.${C_RESET}"
+    return 1
+}
+
+ff_apt_install() {
+    local -a packages=("$@")
+    (( ${#packages[@]} > 0 )) || return 0
+
+    ff_apt_update || return 1
+    DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Use-Pty=0 install "${packages[@]}"
+}
+
+ff_apt_purge() {
+    local -a packages=("$@")
+    (( ${#packages[@]} > 0 )) || return 0
+    DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Use-Pty=0 purge "${packages[@]}"
+}
+
+# Mandatory Dependency Check (Added jq and curl)
+check_environment() {
+    local missing_packages=()
+    local cmd
+
+    for cmd in bc jq curl wget; do
+        if ! command -v "$cmd" &> /dev/null; then
+            missing_packages+=("$cmd")
+        fi
+    done
+
+    if (( ${#missing_packages[@]} > 0 )); then
+        echo -e "${C_YELLOW}⚠️ Installing missing dependencies: ${missing_packages[*]}${C_RESET}"
+        ff_apt_install "${missing_packages[@]}" >/dev/null 2>&1 || {
+            echo -e "${C_RED}❌ Error: Failed to install required dependencies: ${missing_packages[*]}.${C_RESET}"
+            exit 1
+        }
+    fi
 }
 
 ensure_firewallfalcon_dirs() {
@@ -347,7 +498,7 @@ setup_limiter_service() {
     # Combined limiter + bandwidth monitoring
     cat > "$LIMITER_SCRIPT" << 'EOF'
 #!/bin/bash
-# FirewallFalcon limiter version 2026-03-27.1
+# FirewallFalcon limiter version 2026-04-05.1
 DB_FILE="/etc/firewallfalcon/users.db"
 BW_DIR="/etc/firewallfalcon/bandwidth"
 PID_DIR="$BW_DIR/pidtrack"
@@ -614,7 +765,8 @@ EOF
 }
 
 sync_runtime_components_if_needed() {
-    local limiter_marker="# FirewallFalcon limiter version 2026-03-27.1"
+    local limiter_marker="# FirewallFalcon limiter version 2026-04-05.1"
+    cleanup_legacy_bandwidth_runtime
     if [[ ! -f "$LIMITER_SCRIPT" ]] || ! grep -Fqx "$limiter_marker" "$LIMITER_SCRIPT" 2>/dev/null; then
         setup_limiter_service >/dev/null 2>&1
     fi
@@ -632,12 +784,25 @@ sync_runtime_components_if_needed() {
 setup_bandwidth_service() {
     mkdir -p "$BANDWIDTH_DIR"
     # Bandwidth monitoring is now integrated into the limiter service above.
-    # Stop the old standalone bandwidth service if it exists.
-    if systemctl is-active --quiet firewallfalcon-bandwidth 2>/dev/null; then
-        systemctl stop firewallfalcon-bandwidth &>/dev/null
-        systemctl disable firewallfalcon-bandwidth &>/dev/null
+    cleanup_legacy_bandwidth_runtime
+}
+
+cleanup_legacy_bandwidth_runtime() {
+    local needs_reload=false
+
+    systemctl stop firewallfalcon-bandwidth &>/dev/null || true
+    systemctl disable firewallfalcon-bandwidth &>/dev/null || true
+    pkill -f "firewallfalcon-bandwidth" &>/dev/null || true
+
+    if [[ -e "$BANDWIDTH_SERVICE" || -e "$BANDWIDTH_SCRIPT" || -e "$LEGACY_BANDWIDTH_DIR" ]]; then
+        rm -f "$BANDWIDTH_SERVICE" "$BANDWIDTH_SCRIPT" 2>/dev/null
+        rm -rf "$LEGACY_BANDWIDTH_DIR" 2>/dev/null
+        needs_reload=true
     fi
-    rm -f "$BANDWIDTH_SERVICE" "$BANDWIDTH_SCRIPT" 2>/dev/null
+
+    if $needs_reload; then
+        systemctl daemon-reload &>/dev/null || true
+    fi
 }
 
 setup_trial_cleanup_script() {
@@ -752,7 +917,7 @@ generate_dns_record() {
     echo -e "\n${C_BLUE}⚙️ Generating a random domain...${C_RESET}"
     if ! command -v jq &> /dev/null; then
         echo -e "${C_YELLOW}⚠️ jq not found, attempting to install...${C_RESET}"
-        apt-get update > /dev/null 2>&1 && apt-get install -y jq || {
+        ff_apt_install jq >/dev/null 2>&1 || {
             echo -e "${C_RED}❌ Failed to install jq. Cannot manage DNS records.${C_RESET}"
             return 1
         }
@@ -1830,9 +1995,12 @@ install_badvpn() {
     fi
     check_and_open_firewall_port 7300 udp || return
     echo -e "\n${C_GREEN}🔄 Updating package lists...${C_RESET}"
-    apt-get update
+    ff_apt_update || return
     echo -e "\n${C_GREEN}📦 Installing all required packages...${C_RESET}"
-    apt-get install -y cmake g++ make screen git build-essential libssl-dev libnspr4-dev libnss3-dev pkg-config
+    ff_apt_install cmake g++ make screen git build-essential libssl-dev libnspr4-dev libnss3-dev pkg-config || {
+        echo -e "${C_RED}❌ Failed to install badvpn build dependencies.${C_RESET}"
+        return
+    }
     echo -e "\n${C_GREEN}📥 Cloning badvpn from github...${C_RESET}"
     git clone https://github.com/ambrop72/badvpn.git "$BADVPN_BUILD_DIR"
     cd "$BADVPN_BUILD_DIR" || { echo -e "${C_RED}❌ Failed to change directory to build folder.${C_RESET}"; return; }
@@ -1955,7 +2123,7 @@ ensure_edge_stack_packages() {
 
     if (( ${#missing_packages[@]} > 0 )); then
         echo -e "\n${C_BLUE}📦 Installing required packages: ${missing_packages[*]}${C_RESET}"
-        apt-get update && apt-get install -y "${missing_packages[@]}" || {
+        ff_apt_install "${missing_packages[@]}" || {
             echo -e "${C_RED}❌ Failed to install the required packages.${C_RESET}"
             return 1
         }
@@ -1998,8 +2166,7 @@ _install_certbot() {
         return 0
     fi
     echo -e "${C_BLUE}📦 Installing Certbot...${C_RESET}"
-    apt-get update > /dev/null 2>&1
-    apt-get install -y certbot || {
+    ff_apt_install certbot || {
         echo -e "${C_RED}❌ Failed to install Certbot.${C_RESET}"
         return 1
     }
@@ -2986,7 +3153,12 @@ install_zivpn() {
     
     # Generate Certificates
     echo -e "${C_BLUE}🔐 Generating self-signed certificates...${C_RESET}"
-    if ! command -v openssl &>/dev/null; then apt-get install -y openssl &>/dev/null; fi
+    if ! command -v openssl &>/dev/null; then
+        ff_apt_install openssl >/dev/null 2>&1 || {
+            echo -e "${C_RED}❌ Failed to install openssl for ZiVPN certificate generation.${C_RESET}"
+            return
+        }
+    fi
     
     openssl req -new -newkey rsa:4096 -days 365 -nodes -x509 \
         -subj "/C=US/ST=California/L=Los Angeles/O=Example Corp/OU=IT Department/CN=zivpn" \
@@ -3141,7 +3313,7 @@ purge_nginx() {
     systemctl stop nginx >/dev/null 2>&1
     systemctl disable nginx >/dev/null 2>&1
     echo -e "\n${C_BLUE}🗑️ Purging Nginx packages...${C_RESET}"
-    apt-get purge -y nginx nginx-common >/dev/null 2>&1
+    ff_apt_purge nginx nginx-common >/dev/null 2>&1
     apt-get autoremove -y >/dev/null 2>&1
     echo -e "\n${C_BLUE}🗑️ Removing leftover files...${C_RESET}"
     rm -f /etc/ssl/certs/nginx-selfsigned.pem
@@ -3623,6 +3795,7 @@ uninstall_script() {
     systemctl disable firewallfalcon-bandwidth &>/dev/null
     rm -f "$BANDWIDTH_SERVICE"
     rm -f "$BANDWIDTH_SCRIPT"
+    rm -rf "$LEGACY_BANDWIDTH_DIR"
     rm -f "$TRIAL_CLEANUP_SCRIPT"
     
     echo -e "\n${C_BLUE}\ud83d\uddd1\ufe0f Removing SSH login banner...${C_RESET}"
@@ -3667,7 +3840,7 @@ create_trial_account() {
     # Ensure 'at' daemon is available
     if ! command -v at &>/dev/null; then
         echo -e "${C_YELLOW}⚠️ 'at' command not found. Installing...${C_RESET}"
-        apt-get update > /dev/null 2>&1 && apt-get install -y at || {
+        ff_apt_install at >/dev/null 2>&1 || {
             echo -e "${C_RED}❌ Failed to install 'at'. Cannot schedule auto-expiry.${C_RESET}"
             return
         }
@@ -4079,12 +4252,15 @@ traffic_monitor_menu() {
                echo -e "   This tool provides persistent history (Daily/Monthly reports)."
                echo -e "   It is lightweight but requires installation."
                read -p "👉 Install vnStat now? (y/n): " confirm
-               if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-                    echo -e "\n${C_BLUE}📦 Installing vnStat...${C_RESET}"
-                    apt-get update >/dev/null 2>&1
-                    apt-get install -y vnstat >/dev/null 2>&1
-                    systemctl enable vnstat >/dev/null 2>&1
-                    systemctl restart vnstat >/dev/null 2>&1
+                if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+                     echo -e "\n${C_BLUE}📦 Installing vnStat...${C_RESET}"
+                     ff_apt_install vnstat >/dev/null 2>&1 || {
+                         echo -e "${C_RED}❌ Failed to install vnStat.${C_RESET}"
+                         sleep 1
+                         return
+                     }
+                     systemctl enable vnstat >/dev/null 2>&1
+                     systemctl restart vnstat >/dev/null 2>&1
                     local default_iface=$(ip -4 route ls | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
                     vnstat --add -i "$default_iface" >/dev/null 2>&1
                     echo -e "${C_GREEN}✅ Installed.${C_RESET}"
